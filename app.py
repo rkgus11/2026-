@@ -6,13 +6,13 @@ Streamlit 메인 앱
 import os
 import socket
 
-import joblib
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+import infer
 from policies import (
     LOW_INCOME_INFO,
     NEWS_ITEMS,
@@ -26,10 +26,7 @@ matplotlib.use("Agg")
 
 BASE_DIR = os.path.dirname(__file__)
 MODEL_DIR = os.path.join(BASE_DIR, "models")
-MLP_PATH = os.path.join(MODEL_DIR, "mlp_model.h5")
-MLP_SCALER_PATH = os.path.join(MODEL_DIR, "mlp_scaler.pkl")
-LSTM_PATH = os.path.join(MODEL_DIR, "lstm_model.h5")
-LSTM_SCALER_PATH = os.path.join(MODEL_DIR, "lstm_scaler.pkl")
+WEIGHTS_PATH = os.path.join(MODEL_DIR, "weights.npz")
 
 REGIONS = [
     "서울", "경기", "인천", "부산", "대구", "광주", "대전", "울산", "세종",
@@ -52,16 +49,9 @@ def check_internet() -> bool:
 
 @st.cache_resource
 def load_models():
-    if not all(os.path.exists(p) for p in [MLP_PATH, MLP_SCALER_PATH, LSTM_PATH, LSTM_SCALER_PATH]):
-        return None, None, None, None
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-    from tensorflow import keras
-
-    mlp = keras.models.load_model(MLP_PATH, compile=False)
-    mlp_scaler = joblib.load(MLP_SCALER_PATH)
-    lstm = keras.models.load_model(LSTM_PATH, compile=False)
-    lstm_scaler = joblib.load(LSTM_SCALER_PATH)
-    return mlp, mlp_scaler, lstm, lstm_scaler
+    if not os.path.exists(WEIGHTS_PATH):
+        return None
+    return infer.load_weights(WEIGHTS_PATH)
 
 
 def synthesize_history(monthly_cost: float) -> np.ndarray:
@@ -69,18 +59,12 @@ def synthesize_history(monthly_cost: float) -> np.ndarray:
     return monthly_cost * normalized
 
 
-def predict_risk(mlp, mlp_scaler, income: float, members: int, energy_cost: float) -> float:
-    ratio = energy_cost / income if income > 0 else 1.0
-    features = np.array([[income, members, energy_cost, ratio]], dtype=np.float32)
-    scaled = mlp_scaler.transform(features)
-    return float(np.asarray(mlp(scaled, training=False))[0][0])
+def predict_risk(weights, income: float, members: int, energy_cost: float) -> float:
+    return infer.predict_risk(weights, income, members, energy_cost)
 
 
-def predict_costs(lstm, lstm_scaler, history: np.ndarray) -> np.ndarray:
-    scaled = lstm_scaler.transform(history.reshape(-1, 1)).reshape(1, 12, 1).astype(np.float32)
-    pred_scaled = np.asarray(lstm(scaled, training=False))[0]
-    pred = lstm_scaler.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
-    return pred
+def predict_costs(weights, history: np.ndarray) -> np.ndarray:
+    return infer.predict_costs(weights, history)
 
 
 def apply_policy_discount(predictions: np.ndarray, discount: float) -> np.ndarray:
@@ -203,11 +187,14 @@ def page_results():
         return
 
     data = st.session_state["input_data"]
-    with st.spinner("딥러닝 모델을 불러오는 중입니다... (최초 1회만 시간이 걸립니다)"):
-        mlp, mlp_scaler, lstm, lstm_scaler = load_models()
+    with st.spinner("모델을 불러오는 중입니다..."):
+        weights = load_models()
 
-    if mlp is None:
-        st.error("학습된 모델이 없습니다. 터미널에서 `python setup_all.py`를 실행하여 모델을 학습해 주세요.")
+    if weights is None:
+        st.error(
+            "학습된 모델 가중치가 없습니다. 터미널에서 `python setup_all.py` 실행 후 "
+            "`python export_weights.py`를 실행하여 가중치를 생성해 주세요."
+        )
         return
 
     st.subheader("입력 정보 요약")
@@ -226,7 +213,7 @@ def page_results():
     )
     st.dataframe(summary, use_container_width=True, hide_index=True)
 
-    risk = predict_risk(mlp, mlp_scaler, data["income"], data["members"], data["energy_cost"])
+    risk = predict_risk(weights, data["income"], data["members"], data["energy_cost"])
     policies = recommend_policies(risk)
 
     st.subheader("에너지 빈곤 위험도 (MLP 예측)")
@@ -260,7 +247,7 @@ def page_results():
 
     st.subheader("정책 적용 후 월별 에너지 비용 예측 (LSTM)")
     history = synthesize_history(data["energy_cost"])
-    baseline = predict_costs(lstm, lstm_scaler, history)
+    baseline = predict_costs(weights, history)
     discount = get_max_discount(policies)
     after_policy = apply_policy_discount(baseline, discount)
 
